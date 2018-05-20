@@ -19,6 +19,15 @@ import numpy
 import math
 import matplotlib.pyplot as plt
 
+NDEBUG = True
+
+def radMask(index,radius,array):
+    a,b = index
+    nx,ny = array.shape
+    y,x = numpy.ogrid[-a:nx-a,-b:ny-b]
+    mask = x*x + y*y <= radius*radius
+
+    return mask
 
 class ME134_Explorer:
 
@@ -36,6 +45,8 @@ class ME134_Explorer:
         self.last_map = None
         self.last_map_numpy = None
         self.last_map_extents = None
+
+        self.V = None
         
         self.last_global_costmap = None
         self.last_global_costmap_numpy = None
@@ -76,7 +87,8 @@ class ME134_Explorer:
     # This works, but you might find a better way
     def AddInplaceRotationsToQueue(self):
         x,y,yaw = self.last_pose
-        for yaw_target in [math.pi/2,math.pi,-math.pi/2,0]:
+        # for yaw_target in [math.pi/2,math.pi,-math.pi/2,0]:
+        for yaw_target in [0.66*math.pi,-0.66*math.pi]:
             self.goal_queue.append((x,y,yaw_target))
             pass
         pass
@@ -246,8 +258,85 @@ class ME134_Explorer:
             return client.get_result()
         pass
 
+    # returns the expected information gain of a cell given our current belief
+    def cellEIG(self, x, y):
+        ptrue = 0.9
+        def cellEntropy(p):
+            if p < 0:
+                return numpy.log(2)
+            return -p * numpy.log(p) - (1 - p) * numpy.log(1 - p)
+        
+        p = self.last_map_numpy[x, y]
+        if p < 0:
+            return 0.5983
+        elif p == 0 or p >=1:
+            return 4.259045e-6
+        p_o = ptrue * p + (1 - ptrue) * (1 - p)
+        p_n = ptrue * (1 - p) + (1 - ptrue) * p
+        EH = -ptrue * p * numpy.log(ptrue * p / p_o) - ptrue * (1 - p) * numpy.log(ptrue * (1 - p) / p_n)
+        return cellEntropy(p) - EH
+
+    
+    def updateV(self):
+        rospy.loginfo("Updating value map")
+        if self.V is None:
+            self.V = numpy.zeros(self.last_map_numpy.shape)
+        info = self.last_map.info
+        resolution = info.resolution
+        vec_cellEIG = numpy.vectorize(self.cellEIG)
+        eigs = numpy.fromfunction(vec_cellEIG, self.V.shape)
+        def V_cell(x, y):
+            eig = eigs[x,y]
+            if eig > 0:
+                return eig
+            else:
+                mask = radMask((x,y), 1, self.V)
+                mask[(x,y)] = False
+                return numpy.max(self.V[mask]) - resolution
+        vec_V_cell = numpy.vectorize(V_cell)
+        delta = 9999999
+        n = 0
+        while delta > 10:
+            n += 1
+            V = numpy.fromfunction(vec_V_cell, self.V.shape)
+            delta = numpy.linalg.norm(V - self.V)
+            self.V = V
+            print "iteration:", n, " delta:", delta
+        rospy.loginfo("Value iteration took " + str(n) + " iterations to converge")
+        
+    def ValueIteration(self):
+        self.updateV()
+        if not self.frontier_indices:
+            return None
+        try:
+            pt = self.frontier_indices[numpy.argmax(self.V[zip(*self.frontier_indices)])]
+        except IndexError as e:
+            print self.frontier_indices
+            print self.V.shape
+            print e
+            return None
+        return self.ConvertMapIndicesToMeters(*pt)
+
+
+    # returns the relevant cells for calculating EIG
+    # since robots rotates to scan 360 deg, we just use the radius of scan.
+    def goalEIG(self, x, y, scan_radius):
+        mask = radMask((x,y), scan_radius, m)        
+        return numpy.mean([self.cellEIG(*p) for p in mask])
+            
+
+
+    # returns max value within radius
+    def wallMaxPool(self, m, x, y, radius):
+        return numpy.max(m[radMask((x,y), radius, m)])
+
     # returns indices of frontiers
     def FindFrontier(self,m):
+        info = self.last_map.info
+        resolution = info.resolution
+
+        safety_radius_cells = 1 * self.safety_radius_m/resolution
+
         free_space_indices = numpy.where(m==0)
         #print "free_space_indices=",free_space_indices
         # Note: this is a brute force way - feel free to improve on it!
@@ -256,6 +345,7 @@ class ME134_Explorer:
             has_unknown=False
             has_free=False
             # We've defined a frontier as a free space with at least 1 unknown and 1 free non-diagonal neighbor
+            
             for off_ia,off_ib in ((-1,0),(1,0),(0,-1),(0,1)): 
                 if has_unknown and has_free:
                     break
@@ -273,6 +363,9 @@ class ME134_Explorer:
                     pass
                 pass
             if has_unknown and has_free:
+                if (self.wallMaxPool(self.last_map_numpy, ia, ib, safety_radius_cells) > 0.1
+                    or self.wallMaxPool(self.last_global_costmap_numpy, ia, ib, safety_radius_cells) > 90):
+                    continue
                 frontier_indices.append((ia,ib))
                 pass
             pass
@@ -452,6 +545,19 @@ class ME134_Explorer:
                     self.AddInplaceRotationsToQueue()
                     self.next_mode = self.strategy
                     pass
+                elif self.mode == "ValueIteration":
+                    target_x_y = self.ValueIteration()
+                    if target_x_y is not None:
+                        tx,ty=target_x_y
+                        # we're setting yaw=0 here. You may want to compute yaw angle, or choose it carefully...
+                        self.goal_queue.append((tx,ty,0))
+                        self.next_mode = "Rotating"
+                        pass
+                    else:
+                        print "No Frontiers found"
+                        self.abort = True
+                        pass
+                    pass
                 else:
                     print "Unknown mode={}, perhaps your strategy is not recognized".format(self.mode)
                     return True
@@ -468,14 +574,14 @@ class ME134_Explorer:
 
 def explorer():
     import argparse
-    safety_radius_m_default = 0.25 # 0.1 doesn't work, 0.4 works
+    safety_radius_m_default = 0.3 # 0.1 doesn't work, 0.4 works
     initial_movement_m_default = -0.25
     plot_global_costmap_default=0
-    plot_map_default=1
+    plot_map_default=0
 
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--strategy', choices=['FindClosestFrontier', 'FindRandomEmptySpace'], default='FindClosestFrontier')
+    parser.add_argument('--strategy', choices=['FindClosestFrontier', 'FindRandomEmptySpace', 'ValueIteration'], default='FindClosestFrontier')
     parser.add_argument('--safety_radius_m', type=float, default=safety_radius_m_default, help="default: {}".format(safety_radius_m_default))
     parser.add_argument('--initial_movement_m', type=float, default=initial_movement_m_default, help="default: {}".format(initial_movement_m_default))
 
