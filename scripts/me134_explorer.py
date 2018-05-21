@@ -88,7 +88,11 @@ class ME134_Explorer:
     def AddInplaceRotationsToQueue(self):
         x,y,yaw = self.last_pose
         # for yaw_target in [math.pi/2,math.pi,-math.pi/2,0]:
-        for yaw_target in [0.66*math.pi,-0.66*math.pi]:
+        if yaw >=0:
+            rotate = yaw - math.pi
+        else:
+            rotate = yaw + math.pi
+        for yaw_target in [rotate]:
             self.goal_queue.append((x,y,yaw_target))
             pass
         pass
@@ -335,7 +339,7 @@ class ME134_Explorer:
         info = self.last_map.info
         resolution = info.resolution
 
-        safety_radius_cells = 1 * self.safety_radius_m/resolution
+        safety_radius_cells = 1.5 * self.safety_radius_m/resolution
 
         free_space_indices = numpy.where(m==0)
         #print "free_space_indices=",free_space_indices
@@ -363,8 +367,9 @@ class ME134_Explorer:
                     pass
                 pass
             if has_unknown and has_free:
-                if (self.wallMaxPool(self.last_map_numpy, ia, ib, safety_radius_cells) > 0.1
-                    or self.wallMaxPool(self.last_global_costmap_numpy, ia, ib, safety_radius_cells) > 90):
+                if self.wallMaxPool(self.last_map_numpy, ia, ib, safety_radius_cells) > 0.1:
+                    continue
+                if self.wallMaxPool(self.last_global_costmap_numpy, ia, ib, safety_radius_cells) > 97:
                     continue
                 frontier_indices.append((ia,ib))
                 pass
@@ -501,7 +506,7 @@ class ME134_Explorer:
 
                     self.AddMoveForwardToQueue(self.initial_movement_m)
                     # Then return to the starting place
-                    self.AddMoveForwardToQueue(-self.initial_movement_m)
+                    # self.AddMoveForwardToQueue(-self.initial_movement_m)
                     self.mode = "Initial Movement"
                     self.next_mode = self.strategy
                     #self.next_mode = "Rotating" # If you still have visible frontiers 
@@ -518,9 +523,10 @@ class ME134_Explorer:
                     print("WARNING: Unless you change this code it won't drive anywhere. The goal is too close to a wall. You need to find a place to safely view this spot.")
                     
                     if target_x_y is not None:
+                        x,y,yaw = self.last_pose
                         tx,ty=target_x_y
-                        # we're setting yaw=0 here. You may want to compute yaw angle, or choose it carefully...
-                        self.goal_queue.append((tx,ty,0))
+                        angle_to_goal=math.atan2(ty-y,tx-x)
+                        self.goal_queue.append((tx,ty,angle_to_goal))
                         pass
                     else:
                         print "No Frontiers found"
@@ -548,9 +554,10 @@ class ME134_Explorer:
                 elif self.mode == "ValueIteration":
                     target_x_y = self.ValueIteration()
                     if target_x_y is not None:
+                        x,y,yaw = self.last_pose
                         tx,ty=target_x_y
-                        # we're setting yaw=0 here. You may want to compute yaw angle, or choose it carefully...
-                        self.goal_queue.append((tx,ty,0))
+                        angle_to_goal=math.atan2(ty-y,tx-x)
+                        self.goal_queue.append((tx,ty,angle_to_goal))
                         self.next_mode = "Rotating"
                         pass
                     else:
@@ -568,6 +575,7 @@ class ME134_Explorer:
             print "NoMap yet"
             pass
         if self.abort:
+            print "Exploration is complete!"
             return True
         return False
     pass
